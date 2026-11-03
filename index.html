@@ -75,7 +75,7 @@ button { cursor: pointer; }
 
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; display: grid; gap: 12px; min-width: 0; }
 .hero { background: var(--accent); color: var(--accent-ink); border: 0; }
-.hero .eyebrow { opacity: .85; }
+.hero .eyebrow { color: inherit; opacity: .85; }
 .eyebrow { font-size: 12px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
 .big { font-family: var(--font-display); font-weight: 700; font-size: clamp(34px, 10vw, 44px); line-height: 1; letter-spacing: -0.02em; }
 .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
@@ -176,6 +176,18 @@ h2 { font-family: var(--font-display); font-weight: 700; font-size: 18px; margin
 .sheet-actions { display: grid; gap: 8px; }
 .notice { font-size: 13px; padding: 10px 12px; border-radius: 12px; background: var(--soft); color: var(--fg); }
 .loading { padding: 40px 0; text-align: center; color: var(--muted); }
+.daily { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; background: rgba(255,255,255,.14); border-radius: 12px; padding: 10px 12px; }
+.daily b { font-family: var(--font-display); font-size: 24px; font-weight: 700; }
+.daily span { font-size: 13px; opacity: .92; }
+.daily.warn { background: rgba(0,0,0,.18); }
+.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: calc(150px + env(safe-area-inset-bottom, 0px)); z-index: 30; background: var(--fg); color: var(--bg); border-radius: 12px; padding: 10px 10px 10px 16px; display: flex; align-items: center; gap: 12px; box-shadow: 0 6px 18px rgba(0,0,0,.25); max-width: calc(100% - 32px); }
+.toast button { border: 0; background: none; color: var(--accent); font-weight: 700; padding: 6px 8px; filter: brightness(1.3); }
+.wiz-dots { display: flex; gap: 6px; }
+.wiz-dots i { width: 24px; height: 4px; border-radius: 2px; background: var(--line); }
+.wiz-dots i.on { background: var(--accent); }
+.wiz-list { display: grid; gap: 6px; }
+.wiz-item { display: flex; justify-content: space-between; gap: 8px; align-items: center; padding: 8px 12px; border-radius: 10px; background: var(--bg); }
+.wiz-item button { border: 0; background: none; color: var(--bad); font-size: 18px; padding: 0 4px; }
 :root { padding-top: env(safe-area-inset-top, 0px); }
 body { margin: 0; }
 [hidden] { display: none !important; }
@@ -204,6 +216,7 @@ body { margin: 0; }
 </nav>
 <button class="fab" id="fab" aria-label="Ajouter une opération">+</button>
 
+<div class="toast" id="toast" role="status" hidden><span id="toastMsg"></span><button id="toastUndo">Annuler</button></div>
 <div class="sheet-wrap" id="sheetWrap" hidden>
   <div class="backdrop" data-close></div>
   <div class="sheet" role="dialog" aria-modal="true" id="sheet"></div>
@@ -223,6 +236,7 @@ const money0 = n => eur0.format(Math.round(n || 0));
 const MONTHS = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
 const MSHORT = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
 const START = '2026-09';
+const IS_PWA = true;
 const COLORS = ['#3B82C4', '#2E9E6E', '#D9822B', '#C2456B', '#7A5CC2', '#2A9BA8', '#B8913A', '#6B7F8E', '#D25A3C', '#4F9A3A'];
 const newId = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
 const pad = n => String(n).padStart(2, '0');
@@ -254,6 +268,7 @@ const S = { settings: null, months: {}, ready: false, mode: 'loading', view: 'mo
 const getMonth = k => (S.months[k] ||= { tx: [], rec: [] });
 const cat = id => S.settings?.cats.find(c => c.id === id);
 const goal = id => S.settings?.goals.find(g => g.id === id);
+const autoSaveOf = gid => S.settings?.recurring.find(r => r.kind === 'save' && r.goal === gid);
 
 /* ---------- storage: private db subtree when signed in, this device otherwise ---------- */
 const LS_KEY = 'capEpargne.v1';
@@ -275,7 +290,7 @@ const Store = {
       if (!snap.metadata.fromCache) {
         if (!settings && !this.seeded) { this.seeded = true; S.settings = defaults(); this.saveSettings(); }
         S.ready = !!S.settings;
-        if (S.ready && !this.recDone) { this.recDone = true; applyRecurring(); }
+        if (S.ready && !this.recDone) { this.recDone = true; afterLoad(); }
       } else if (settings) S.ready = true;
       render();
     }, () => { S.banner = 'La synchronisation s’est arrêtée. Recharge la page pour la relancer.'; render(); });
@@ -286,7 +301,7 @@ const Store = {
     S.settings = raw?.settings || defaults();
     S.months = raw?.months || {};
     S.ready = true;
-    applyRecurring();
+    afterLoad();
     render();
   },
   persistLocal() { try { localStorage.setItem(LS_KEY, JSON.stringify({ settings: S.settings, months: S.months })); } catch (e) {} },
@@ -315,21 +330,65 @@ function monthsText(r) {
   if (!r.months?.length) return 'tous les mois';
   return [...r.months].sort((a, b) => a - b).map(m => MSHORT[m - 1]).join(', ');
 }
-function applyRecurring() {
-  if (!S.settings) return;
-  const t = todayStr(), cur = mkey(t), d = Number(t.slice(8));
+function recTx(r, k) {
+  const day = Math.min(r.day, lastDay(k));
+  const t = { id: `r-${r.id}-${k}`, kind: r.kind, amount: r.amount, note: r.label, date: `${k}-${pad(day)}`, rec: r.id };
+  if (r.kind === 'save') t.goal = r.goal; else t.cat = r.cat;
+  return t;
+}
+/* Past occurrences of r not yet in the books (months before the current one, or earlier this month) */
+function missedOccurrences(r) {
+  const t = todayStr(), cur = mkey(t), d = Number(t.slice(8)), list = [];
   for (let k = START; k <= cur; k = addMonths(k, 1)) {
-    const m = getMonth(k); let changed = false;
-    for (const r of S.settings.recurring || []) {
-      if (m.rec.includes(r.id) || !recApplies(r, k)) continue;
-      const day = Math.min(r.day, lastDay(k));
-      if (k === cur && day > d) continue;
-      const txId = `r-${r.id}-${k}`;
-      if (!m.tx.some(x => x.id === txId)) m.tx.push({ id: txId, kind: r.kind, amount: r.amount, cat: r.cat, note: r.label, date: `${k}-${pad(day)}`, rec: r.id });
-      m.rec.push(r.id); changed = true;
-    }
-    if (changed) Store.saveMonth(k);
+    if (!recApplies(r, k) || (S.months[k]?.rec || []).includes(r.id)) continue;
+    if (k === cur && Math.min(r.day, lastDay(k)) > d) continue;
+    list.push(k);
   }
+  return list;
+}
+function applyRecurring(only) {
+  if (!S.settings) return;
+  for (const r of S.settings.recurring || []) {
+    if (only && r.id !== only) continue;
+    for (const k of missedOccurrences(r)) {
+      const m = getMonth(k), tx = recTx(r, k);
+      if (!m.tx.some(x => x.id === tx.id)) m.tx.push(tx);
+      m.rec.push(r.id); Store.saveMonth(k);
+    }
+  }
+}
+/* Mark occurrences as handled without creating them (user declined the catch-up) */
+function skipOccurrences(r, months) {
+  for (const k of months) { const m = getMonth(k); if (!m.rec.includes(r.id)) { m.rec.push(r.id); Store.saveMonth(k); } }
+}
+/* Upcoming recurring items of month k that are not booked yet */
+function upcoming(k) {
+  const t = todayStr(), cur = mkey(t), d = Number(t.slice(8));
+  if (k < cur || !S.settings) return [];
+  const booked = S.months[k]?.rec || [];
+  return S.settings.recurring
+    .filter(r => recApplies(r, k) && !booked.includes(r.id) && (k > cur || Math.min(r.day, lastDay(k)) > d))
+    .map(r => recTx(r, k)).sort((a, b) => a.date.localeCompare(b.date));
+}
+function goalSaved(g) {
+  let s = g.initial || 0;
+  for (const m of Object.values(S.months)) for (const t of m.tx || []) if (t.kind === 'save' && t.goal === g.id) s += t.amount;
+  return Math.round(s * 100) / 100;
+}
+/* One-time upgrades of stored data, then book due recurring items */
+const daysSince = d => (Date.now() - new Date(d + 'T12:00:00').getTime()) / 864e5;
+function afterLoad() {
+  let changed = false;
+  if (!S.settings.created) { S.settings.created = todayStr(); changed = true; }
+  for (const g of S.settings.goals || []) {
+    if (g.initial === undefined) {
+      const fromTx = goalSaved({ ...g, initial: 0 });
+      g.initial = Math.max(0, Math.round(((g.saved || 0) - fromTx) * 100) / 100);
+      delete g.saved; changed = true;
+    }
+  }
+  if (changed) Store.saveSettings();
+  applyRecurring();
 }
 
 /* ---------- computations ---------- */
@@ -344,9 +403,13 @@ function totals(k) {
   return { inc, out, save, rest: inc - out - save, byCat, tx };
 }
 function goalPlan(g) {
-  const left = Math.max(g.target - (g.saved || 0), 0);
+  const left = Math.max(g.target - goalSaved(g), 0);
   if (!g.deadline) return { left, months: null, perMonth: null };
-  const n = monthIndex(g.deadline) - monthIndex(mkey(todayStr())) + 1;
+  /* With automatic saving, count from its next transfer; otherwise this month still counts */
+  const auto = autoSaveOf(g.id);
+  let first = mkey(todayStr());
+  if (auto) { const a = autoStart(auto.day); first = auto.start > a ? auto.start : a; }
+  const n = monthIndex(g.deadline) - monthIndex(first) + 1;
   return { left, months: n, perMonth: n > 0 ? left / n : null };
 }
 function budgetState(spent, budget) {
@@ -358,50 +421,87 @@ function budgetState(spent, budget) {
 }
 
 /* ---------- views ---------- */
+function txRow(t, k, future) {
+  const c = t.kind === 'save' ? null : cat(t.cat), g = t.kind === 'save' ? goal(t.goal) : null;
+  const color = g ? 'var(--good)' : (c?.color || 'var(--muted)');
+  const name = t.note || (g ? g.name : c?.name) || 'Opération';
+  const sub = t.kind === 'save' ? `Projet · ${g?.name || 'projet supprimé'}` : (c?.name || 'Catégorie supprimée');
+  const sign = t.kind === 'out' ? '−' : t.kind === 'in' ? '+' : '→';
+  const attrs = future ? `data-action="edit-rec" data-id="${esc(t.rec)}" style="opacity:.6"` : `data-action="edit-tx" data-id="${esc(t.id)}" data-month="${esc(k)}"`;
+  return `<button class="row" ${attrs}>
+    <span class="dot" style="background:${esc(color)}"></span>
+    <span style="min-width:0"><div class="name">${esc(name)}${t.rec ? `<span class="tag">${future ? 'prévu' : 'auto'}</span>` : ''}</div><div class="sub">${esc(sub)}</div></span>
+    <span class="amt ${t.kind}">${sign} ${money(t.amount)}</span></button>`;
+}
 function viewMois() {
-  const k = S.month, T = totals(k);
-  const s = S.settings;
+  const k = S.month, T = totals(k), s = S.settings;
+  const today = todayStr(), cur = mkey(today);
+  const up = upcoming(k);
+  const upNet = up.reduce((a, t) => a + (t.kind === 'in' ? t.amount : -t.amount), 0);
+  const projected = T.rest + upNet;
+  const mName = MONTHS[Number(k.slice(5)) - 1];
   const fresh = !s.recurring.length && !s.goals.length && !Object.values(S.months).some(m => m.tx?.length) && !s.cats.some(c => c.budget);
-  let html = `
-  <section class="card hero">
-    <div class="eyebrow">Reste à vivre en ${esc(MONTHS[Number(k.slice(5)) - 1])}</div>
-    <div class="big">${money(T.rest)}</div>
-    <div class="stats">
-      <div class="stat"><small>Revenus</small><b>${money0(T.inc)}</b></div>
-      <div class="stat"><small>Dépenses</small><b>${money0(T.out)}</b></div>
-      <div class="stat"><small>Mis de côté</small><b>${money0(T.save)}</b></div>
-    </div>
-  </section>`;
+  let html;
+  if (k > cur) {
+    html = `<section class="card hero">
+      <div class="eyebrow">Prévu en ${esc(mName)}</div>
+      <div class="big">${money(projected)}</div>
+      <div class="small" style="opacity:.9">Ce qu’il restera après tes revenus, charges et épargnes automatiques, avant tes dépenses courantes.</div>
+    </section>`;
+  } else {
+    let extra = '';
+    if (k === cur && (T.inc || T.out || up.length)) {
+      const daysLeft = lastDay(k) - Number(today.slice(8)) + 1;
+      extra = projected >= 0
+        ? `<div class="daily"><b>${money0(projected / daysLeft)}</b><span>par jour à dépenser jusqu’au ${lastDay(k)} ${esc(mName)}</span></div>
+           ${up.length ? `<div class="small" style="opacity:.9">Fin de mois prévue : <b>${money0(projected)}</b> après ${up.length} opération${up.length > 1 ? 's' : ''} à venir</div>` : ''}`
+        : `<div class="daily warn"><b>${money0(projected)}</b><span>prévu en fin de mois : tu es dans le rouge, freine les dépenses</span></div>`;
+    }
+    html = `<section class="card hero">
+      <div class="eyebrow">Reste à vivre en ${esc(mName)}</div>
+      <div class="big">${money(T.rest)}</div>
+      ${extra}
+      <div class="stats">
+        <div class="stat"><small>Revenus</small><b>${money0(T.inc)}</b></div>
+        <div class="stat"><small>Dépenses</small><b>${money0(T.out)}</b></div>
+        <div class="stat"><small>Mis de côté</small><b>${money0(T.save)}</b></div>
+      </div>
+    </section>`;
+  }
   if (fresh) html += `
   <section class="card">
-    <h2>Pour bien démarrer</h2>
-    <div class="steps">
-      <button class="step" data-action="settings"><i>1</i><div><b>Ajoute tes revenus et charges fixes</b><span>Salaire, CAF, loyer, abonnements : ils s’ajouteront tout seuls chaque mois.</span></div></button>
-      <button class="step" data-action="go" data-view="budgets"><i>2</i><div><b>Fixe un plafond par catégorie</b><span>Courses, sorties, shopping… l’app te prévient avant que tu dépasses.</span></div></button>
-      <button class="step" data-action="go" data-view="projets"><i>3</i><div><b>Crée ton premier projet</b><span>Un voyage, une date, un montant : tu sais combien mettre de côté par mois.</span></div></button>
-    </div>
+    <h2>Bienvenue sur Cap Épargne</h2>
+    <div class="muted">Trois questions sur tes revenus, tes charges fixes et ton prochain voyage. Ensuite, l’app calcule ce que tu peux dépenser chaque jour et ce qu’il faut mettre de côté.</div>
+    <button class="btn block" data-action="wizard">Configurer en 2 minutes</button>
   </section>`;
-  const tx = [...T.tx].sort((a, b) => b.date.localeCompare(a.date) || (b.ts || 0) - (a.ts || 0));
-  html += `<section class="card"><div class="section-head"><h2>Opérations</h2><span class="muted small">${tx.length} ce mois</span></div>`;
-  if (!tx.length) html += `<div class="empty"><div>Aucune opération en ${esc(monthLabel(k))}.</div><button class="btn ghost" data-action="add">Ajouter une dépense</button></div>`;
-  else {
-    html += '<div class="list">';
+  if (IS_PWA && !fresh && (s.lastExport ? daysSince(s.lastExport) > 30 : daysSince(s.created || todayStr()) > 14)) html += `
+  <section class="card"><div class="small">${s.lastExport ? `Dernière sauvegarde le ${esc(dayLabel(s.lastExport))}.` : 'Tu n’as jamais exporté de sauvegarde.'} Tes données ne sont que sur cet appareil.</div>
+  <button class="btn ghost" data-action="export">Exporter une sauvegarde</button></section>`;
+  if (up.length) {
+    html += `<section class="card"><div class="section-head"><h2>À venir</h2><span class="muted small">${up.length} prévue${up.length > 1 ? 's' : ''}</span></div><div class="list">`;
     let last = '';
-    for (const t of tx) {
+    for (const t of up) {
       if (t.date !== last) { html += `<div class="day">${esc(dayLabel(t.date))}</div>`; last = t.date; }
-      const c = t.kind === 'save' ? null : cat(t.cat), g = t.kind === 'save' ? goal(t.goal) : null;
-      const color = g ? 'var(--good)' : (c?.color || 'var(--muted)');
-      const name = t.note || (g ? g.name : c?.name) || 'Opération';
-      const sub = t.kind === 'save' ? `Projet · ${g?.name || 'projet supprimé'}` : (c?.name || 'Catégorie supprimée');
-      const sign = t.kind === 'out' ? '−' : t.kind === 'in' ? '+' : '→';
-      html += `<button class="row" data-action="edit-tx" data-id="${esc(t.id)}" data-month="${esc(k)}">
-        <span class="dot" style="background:${esc(color)}"></span>
-        <span style="min-width:0"><div class="name">${esc(name)}${t.rec ? '<span class="tag">auto</span>' : ''}</div><div class="sub">${esc(sub)}</div></span>
-        <span class="amt ${t.kind}">${sign} ${money(t.amount)}</span></button>`;
+      html += txRow(t, k, true);
     }
-    html += '</div>';
+    html += '</div></section>';
   }
-  return html + '</section>';
+  const tx = [...T.tx].sort((a, b) => b.date.localeCompare(a.date) || (b.ts || 0) - (a.ts || 0));
+  if (k <= cur || tx.length) {
+    html += `<section class="card"><div class="section-head"><h2>Opérations</h2><span class="muted small">${tx.length} ce mois</span></div>`;
+    if (!tx.length) html += `<div class="empty"><div>Aucune opération en ${esc(monthLabel(k))}.</div><button class="btn ghost" data-action="add">Ajouter une dépense</button></div>`;
+    else {
+      html += '<div class="list">';
+      let last = '';
+      for (const t of tx) {
+        if (t.date !== last) { html += `<div class="day">${esc(dayLabel(t.date))}</div>`; last = t.date; }
+        html += txRow(t, k, false);
+      }
+      html += '</div>';
+    }
+    html += '</section>';
+  }
+  return html;
 }
 
 function viewBudgets() {
@@ -431,7 +531,7 @@ function viewBudgets() {
 
 function viewProjets() {
   const goals = S.settings.goals;
-  const saved = goals.reduce((a, g) => a + (g.saved || 0), 0);
+  const saved = goals.reduce((a, g) => a + goalSaved(g), 0);
   const perMonth = goals.reduce((a, g) => a + (goalPlan(g).perMonth || 0), 0);
   let html = `<section class="card hero">
     <div class="eyebrow">Mis de côté pour tes projets</div>
@@ -443,7 +543,8 @@ function viewProjets() {
     <div>Un voyage au Japon, un week-end à Lisbonne, un nouvel ordi… Donne un montant et une date, l’app calcule ton effort mensuel.</div>
     <button class="btn" data-action="new-goal">Créer un projet</button></div></section>`;
   for (const g of goals) {
-    const p = goalPlan(g), pct = g.target ? Math.min(100, (g.saved || 0) / g.target * 100) : 0;
+    const sv = goalSaved(g), p = goalPlan(g), pct = g.target ? Math.min(100, sv / g.target * 100) : 0;
+    const auto = autoSaveOf(g.id);
     let plan;
     if (p.left <= 0) plan = `<span class="state ok">Objectif atteint, bon voyage !</span>`;
     else if (p.months === null) plan = `<span class="muted small">Il reste ${money0(p.left)} · ajoute une date pour un plan mensuel</span>`;
@@ -452,8 +553,10 @@ function viewProjets() {
     html += `<section class="card goal">
       <div class="title"><b>${esc(g.name)}</b><span class="pct">${Math.round(pct)} %</span></div>
       <div class="bar"><i style="width:${pct}%"></i></div>
-      <div class="line" style="display:flex;justify-content:space-between;gap:8px"><span>${money0(g.saved || 0)} <span class="muted">sur ${money0(g.target)}</span></span><span class="muted small">${g.deadline ? 'avant ' + esc(monthLabel(g.deadline)) : 'sans date'}</span></div>
+      <div class="line" style="display:flex;justify-content:space-between;gap:8px"><span>${money0(sv)} <span class="muted">sur ${money0(g.target)}</span></span><span class="muted small">${g.deadline ? 'avant ' + esc(monthLabel(g.deadline)) : 'sans date'}</span></div>
       ${plan}
+      ${auto ? `<div class="notice small">Épargne auto : <b>${money0(auto.amount)}</b> le ${auto.day === 1 ? '1er' : auto.day} de chaque mois${p.perMonth && p.left > 0 && auto.amount < p.perMonth - 0.5 ? ` · <span class="state warn">il faudrait ${money0(p.perMonth)} pour tenir la date</span>` : ''}</div>`
+        : p.left > 0 ? `<div class="muted small">Astuce : active l’épargne automatique dans « Modifier » pour ne plus y penser.</div>` : ''}
       <div class="actions"><button class="btn" data-action="save-to" data-id="${esc(g.id)}">Mettre de côté</button><button class="btn ghost" data-action="edit-goal" data-id="${esc(g.id)}">Modifier</button></div>
     </section>`;
   }
@@ -518,15 +621,16 @@ function niceStep(raw) {
 
 function viewReglages() {
   const s = S.settings;
-  let html = `<section class="card"><div class="section-head"><h2>Revenus et charges fixes</h2><button class="link" data-action="new-rec">+ Ajouter</button></div>
+  let html = `<section class="card"><div class="section-head"><h2>Revenus, charges et épargne fixes</h2><button class="link" data-action="new-rec">+ Ajouter</button></div>
     <div class="muted small">Ajoutés automatiquement chaque mois, le jour indiqué.</div><div class="list">`;
   if (!s.recurring.length) html += `<div class="empty">Rien pour l’instant. Exemples : salaire le 28, loyer le 5, forfait mobile le 12.</div>`;
-  const recs = [...s.recurring].sort((a, b) => (a.kind === b.kind ? a.day - b.day : a.kind === 'in' ? -1 : 1));
+  const order = { in: 0, out: 1, save: 2 };
+  const recs = [...s.recurring].sort((a, b) => order[a.kind] - order[b.kind] || a.day - b.day);
   for (const r of recs) {
-    const c = cat(r.cat);
-    html += `<button class="row" data-action="edit-rec" data-id="${esc(r.id)}"><span class="dot" style="background:${esc(c?.color || 'var(--muted)')}"></span>
-      <span style="min-width:0"><div class="name">${esc(r.label)}</div><div class="sub">le ${r.day} · ${esc(monthsText(r))}${r.start && r.start > START ? ' · dès ' + esc(monthLabel(r.start)) : ''}${r.end ? ' · jusqu’à ' + esc(monthLabel(r.end)) : ''}</div></span>
-      <span class="amt ${r.kind}">${r.kind === 'in' ? '+' : '−'} ${money(r.amount)}</span></button>`;
+    const c = r.kind === 'save' ? null : cat(r.cat), g = r.kind === 'save' ? goal(r.goal) : null;
+    html += `<button class="row" data-action="edit-rec" data-id="${esc(r.id)}"><span class="dot" style="background:${esc(g ? 'var(--good)' : c?.color || 'var(--muted)')}"></span>
+      <span style="min-width:0"><div class="name">${esc(r.label)}</div><div class="sub">le ${r.day === 1 ? '1er' : r.day} · ${esc(monthsText(r))}${r.start && r.start > START ? ' · dès ' + esc(monthLabel(r.start)) : ''}${r.end ? ' · jusqu’à ' + esc(monthLabel(r.end)) : ''}${g ? ' · ' + esc(g.name) : ''}</div></span>
+      <span class="amt ${r.kind}">${r.kind === 'in' ? '+' : r.kind === 'out' ? '−' : '→'} ${money(r.amount)}</span></button>`;
   }
   html += '</div></section>';
   if (s.recurring.length) {
@@ -534,12 +638,13 @@ function viewReglages() {
     html += `<section class="card"><div class="section-head"><h2>Mois par mois</h2><span class="muted small">12 mois dès septembre 2026</span></div><div class="list">`;
     for (let i = 0, k = START; i < 12; i++, k = addMonths(k, 1)) {
       const items = s.recurring.filter(r => recApplies(r, k));
-      const inc = items.filter(r => r.kind === 'in'), out = items.filter(r => r.kind === 'out');
-      const sumIn = inc.reduce((a, r) => a + r.amount, 0), sumOut = out.reduce((a, r) => a + r.amount, 0);
+      const inc = items.filter(r => r.kind === 'in'), out = items.filter(r => r.kind === 'out'), sav = items.filter(r => r.kind === 'save');
+      const sumIn = inc.reduce((a, r) => a + r.amount, 0), sumOut = out.reduce((a, r) => a + r.amount, 0), sumSave = sav.reduce((a, r) => a + r.amount, 0);
+      const free = sumIn - sumOut - sumSave;
       const detail = inc.sort((a, b) => a.day - b.day).map(r => `${r.label} le ${r.day}`).join(' · ');
       html += `<div class="budget"${k === cur ? ' style="background:var(--soft);border-radius:12px;padding-inline:10px"' : ''}>
-        <div class="line"><b style="text-transform:capitalize">${esc(monthLabel(k))}</b><span class="state ${sumIn - sumOut >= 0 ? 'ok' : 'bad'}">${money0(sumIn - sumOut)} dispo</span></div>
-        <div class="line small"><span class="amt in">+ ${money0(sumIn)}</span><span class="muted">− ${money0(sumOut)} de charges</span></div>
+        <div class="line"><b style="text-transform:capitalize">${esc(monthLabel(k))}</b><span class="state ${free >= 0 ? 'ok' : 'bad'}">${money0(free)} dispo</span></div>
+        <div class="line small"><span class="amt in">+ ${money0(sumIn)}</span><span class="muted">− ${money0(sumOut)} charges${sumSave ? ` · → ${money0(sumSave)} épargne` : ''}</span></div>
         ${detail ? `<div class="muted small">${esc(detail)}</div>` : '<div class="muted small">Aucun revenu prévu</div>'}
       </div>`;
     }
@@ -580,7 +685,7 @@ function sheetHead(title) { return `<div class="sheet-head"><h3>${esc(title)}</h
 function txSheet(opts = {}) {
   const editing = opts.tx ? clone(opts.tx) : null;
   const st = { type: 'tx', month: opts.month, orig: editing, kind: editing?.kind || opts.kind || 'out', cat: editing?.cat || null, goal: editing?.goal || opts.goal || null, armed: false };
-  if (!st.cat) st.cat = S.settings.cats.find(c => c.kind === (st.kind === 'in' ? 'in' : 'out'))?.id;
+  if (!st.cat) st.cat = catsByUse(st.kind === 'in' ? 'in' : 'out')[0]?.id;
   if (st.kind === 'save' && !st.goal) st.goal = S.settings.goals[0]?.id || null;
   const defDate = editing?.date || (mkey(todayStr()) === S.month ? todayStr() : `${S.month}-01`);
   openSheet(`${sheetHead(editing ? 'Modifier l’opération' : 'Nouvelle opération')}
@@ -610,8 +715,8 @@ function paintTxSheet() {
   } else {
     label.textContent = 'Catégorie';
     const kind = st.kind === 'in' ? 'in' : 'out';
-    if (!cat(st.cat) || cat(st.cat).kind !== kind) st.cat = S.settings.cats.find(c => c.kind === kind)?.id;
-    p.innerHTML = S.settings.cats.filter(c => c.kind === kind).map(c => `<button class="chip" data-pick-cat="${esc(c.id)}" aria-pressed="${c.id === st.cat}"><span class="dot" style="background:${esc(c.color)}"></span>${esc(c.name)}</button>`).join('');
+    if (!cat(st.cat) || cat(st.cat).kind !== kind) st.cat = catsByUse(kind)[0]?.id;
+    p.innerHTML = catsByUse(kind).map(c => `<button class="chip" data-pick-cat="${esc(c.id)}" aria-pressed="${c.id === st.cat}"><span class="dot" style="background:${esc(c.color)}"></span>${esc(c.name)}</button>`).join('');
   }
 }
 function saveTx() {
@@ -624,28 +729,35 @@ function saveTx() {
   const t = { id: st.orig?.id || newId(), kind: st.kind, amount, date, note: $('#txNote').value.trim(), ts: st.orig?.ts || Date.now() };
   if (st.kind === 'save') t.goal = st.goal; else t.cat = st.cat;
   if (st.orig?.rec) t.rec = st.orig.rec;
-  let goalsChanged = false;
   if (st.orig) {
     const om = getMonth(st.month);
     om.tx = om.tx.filter(x => x.id !== st.orig.id);
-    if (st.orig.kind === 'save' && goal(st.orig.goal)) { goal(st.orig.goal).saved = Math.round(((goal(st.orig.goal).saved || 0) - st.orig.amount) * 100) / 100; goalsChanged = true; }
     if (mkey(date) !== st.month) Store.saveMonth(st.month);
   }
   const nk = mkey(date);
   getMonth(nk).tx.push(t);
-  if (t.kind === 'save') { goal(t.goal).saved = Math.round(((goal(t.goal).saved || 0) + amount) * 100) / 100; goalsChanged = true; }
   Store.saveMonth(nk);
-  if (goalsChanged) Store.saveSettings();
   closeSheet(); render();
 }
-function deleteTx(btn) {
-  const st = sheetState;
-  if (!st.armed) { st.armed = true; btn.classList.add('armed'); btn.textContent = 'Confirmer la suppression'; return; }
-  const m = getMonth(st.month);
-  m.tx = m.tx.filter(x => x.id !== st.orig.id);
-  Store.saveMonth(st.month);
-  if (st.orig.kind === 'save' && goal(st.orig.goal)) { goal(st.orig.goal).saved = Math.round(((goal(st.orig.goal).saved || 0) - st.orig.amount) * 100) / 100; Store.saveSettings(); }
+function deleteTx() {
+  const st = sheetState, k = st.month, removed = st.orig;
+  const m = getMonth(k);
+  m.tx = m.tx.filter(x => x.id !== removed.id);
+  Store.saveMonth(k);
   closeSheet(); render();
+  toast(`Supprimé : ${removed.note || 'opération'}`, () => { const mm = getMonth(k); if (!mm.tx.some(x => x.id === removed.id)) { mm.tx.push(removed); Store.saveMonth(k); render(); } });
+}
+/* Categories of a kind, most used over the last 3 months first */
+function catsByUse(kind) {
+  const count = {}, cur = mkey(todayStr());
+  for (let i = 0; i < 3; i++) for (const t of S.months[addMonths(cur, -i)]?.tx || []) if (!t.rec) count[t.cat] = (count[t.cat] || 0) + 1;
+  return S.settings.cats.filter(c => c.kind === kind).map((c, i) => ({ c, i })).sort((a, b) => (count[b.c.id] || 0) - (count[a.c.id] || 0) || a.i - b.i).map(x => x.c);
+}
+let toastTimer = null, toastUndo = null;
+function toast(msg, undo) {
+  $('#toastMsg').textContent = msg; toastUndo = undo || null;
+  $('#toastUndo').hidden = !undo; $('#toast').hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { $('#toast').hidden = true; toastUndo = null; }, 6000);
 }
 
 /* category */
@@ -684,48 +796,86 @@ function deleteCat(btn) {
 }
 
 /* goal */
+/* First month an automatic saving can still happen: this month if its day is still ahead, else next month */
+const autoStart = day => { const t = todayStr(), cur = mkey(t); return Math.min(day, lastDay(cur)) > Number(t.slice(8)) ? cur : addMonths(cur, 1); };
+function suggestPerMonth(target, initial, deadline) {
+  if (!(target > 0) || !/^\d{4}-\d{2}$/.test(deadline || '')) return null;
+  const first = autoStart(1);
+  const n = monthIndex(deadline) - monthIndex(first) + 1;
+  return n > 0 ? Math.ceil(Math.max(target - (initial || 0), 0) / n) : null;
+}
 function goalSheet(g) {
   const editing = !!g;
-  g = g ? clone(g) : { id: newId(), name: '', target: 0, deadline: '', saved: 0 };
+  g = g ? clone(g) : { id: newId(), name: '', target: 0, deadline: '', initial: 0 };
+  const auto = editing ? autoSaveOf(g.id) : null;
   openSheet(`${sheetHead(editing ? 'Modifier le projet' : 'Nouveau projet')}
     <div class="field"><label for="gName">Projet</label><input id="gName" value="${esc(g.name)}" placeholder="Ex. Japon été 2027" autofocus></div>
     <div class="two-col">
       <div class="field"><label for="gTarget">Montant visé (€)</label><input id="gTarget" inputmode="decimal" placeholder="2500" value="${g.target ? String(g.target).replace('.', ',') : ''}"></div>
-      <div class="field"><label for="gDeadline">Avant (mois)</label><input id="gDeadline" type="month" min="${mkey(todayStr())}" value="${esc(g.deadline || '')}"></div>
+      <div class="field"><label for="gDeadline">Avant (mois)</label><input id="gDeadline" type="month" min="${mkey(todayStr())}" value="${esc(g.deadline || '')}" placeholder="2027-06"></div>
     </div>
-    ${editing ? `<div class="field"><label for="gSaved">Déjà mis de côté (€)</label><input id="gSaved" inputmode="decimal" value="${String(g.saved || 0).replace('.', ',')}"></div>` : ''}
+    <div class="field"><label for="gInitial">Déjà épargné avant l’app (€)</label><input id="gInitial" inputmode="decimal" placeholder="0" value="${g.initial ? String(g.initial).replace('.', ',') : ''}"></div>
+    <div class="card" style="background:var(--soft);border:0;gap:10px">
+      <b>Épargne automatique</b>
+      <div class="two-col">
+        <div class="field"><label for="gAuto">Chaque mois (€)</label><input id="gAuto" inputmode="decimal" placeholder="vide = manuel" value="${auto ? String(auto.amount).replace('.', ',') : ''}"></div>
+        <div class="field"><label for="gAutoDay">Le</label><input id="gAutoDay" type="number" min="1" max="31" value="${auto?.day || 1}"></div>
+      </div>
+      <div class="small" id="gHint"></div>
+    </div>
     <div class="err" id="gErr"></div>
     <div class="sheet-actions"><button class="btn block" data-action="goal-save">${editing ? 'Enregistrer' : 'Créer le projet'}</button>
     ${editing ? '<button class="btn danger block" data-action="goal-del">Supprimer le projet</button>' : ''}</div>`, { type: 'goal', goal: g, editing, armed: false });
+  goalHint();
+}
+function goalHint() {
+  const sugg = suggestPerMonth(parseAmount($('#gTarget').value), parseAmount($('#gInitial').value || '0'), $('#gDeadline').value);
+  $('#gHint').innerHTML = sugg
+    ? `Pour tenir la date : <b>${money0(sugg)}/mois</b>. <button class="link" data-action="goal-use-sugg" data-v="${sugg}">Utiliser ce montant</button>`
+    : '<span class="muted">Indique un montant et une date pour voir combien mettre de côté par mois.</span>';
 }
 function saveGoal() {
-  const g = sheetState.goal;
+  const g = sheetState.goal, err = $('#gErr');
   g.name = $('#gName').value.trim();
   g.target = parseAmount($('#gTarget').value);
   g.deadline = $('#gDeadline').value || '';
-  if (sheetState.editing) { const s = parseAmount($('#gSaved').value || '0'); if (!(s >= 0)) { $('#gErr').textContent = 'Le montant déjà mis de côté doit être un nombre.'; return; } g.saved = s; }
-  if (!g.name) { $('#gErr').textContent = 'Donne un nom à ton projet.'; return; }
-  if (!(g.target > 0)) { $('#gErr').textContent = 'Indique le montant visé, par exemple 2500.'; return; }
-  if (g.deadline && !/^\d{4}-\d{2}$/.test(g.deadline)) { $('#gErr').textContent = 'Écris le mois sous la forme 2027-06.'; return; }
+  const initial = parseAmount($('#gInitial').value || '0');
+  const autoRaw = $('#gAuto').value.trim(), autoAmount = autoRaw ? parseAmount(autoRaw) : 0;
+  const autoDay = Math.round(Number($('#gAutoDay').value));
+  if (!g.name) { err.textContent = 'Donne un nom à ton projet.'; return; }
+  if (!(g.target > 0)) { err.textContent = 'Indique le montant visé, par exemple 2500.'; return; }
+  if (g.deadline && !/^\d{4}-\d{2}$/.test(g.deadline)) { err.textContent = 'Écris le mois sous la forme 2027-06.'; return; }
+  if (!(initial >= 0)) { err.textContent = 'Le montant déjà épargné doit être un nombre, par exemple 300.'; return; }
+  if (autoRaw && !(autoAmount > 0)) { err.textContent = 'L’épargne automatique doit être un montant, par exemple 150. Laisse vide pour épargner à la main.'; return; }
+  if (autoAmount && !(autoDay >= 1 && autoDay <= 31)) { err.textContent = 'Le jour doit être entre 1 et 31.'; return; }
+  g.initial = initial; delete g.saved;
   const i = S.settings.goals.findIndex(x => x.id === g.id);
   if (i >= 0) S.settings.goals[i] = g; else S.settings.goals.push(g);
+  setAutoSave(g, autoAmount, autoDay);
   Store.saveSettings(); closeSheet(); S.view = 'projets'; render();
+}
+function setAutoSave(g, amount, day) {
+  const existing = autoSaveOf(g.id);
+  if (!amount) { if (existing) S.settings.recurring = S.settings.recurring.filter(r => r !== existing); return; }
+  if (existing) Object.assign(existing, { amount, day, label: 'Épargne ' + g.name, end: g.deadline || '' });
+  else S.settings.recurring.push({ id: newId(), kind: 'save', goal: g.id, label: 'Épargne ' + g.name, amount, day, months: [], start: autoStart(day), end: g.deadline || '' });
 }
 function deleteGoal(btn) {
   const st = sheetState;
-  if (!st.armed) { st.armed = true; btn.classList.add('armed'); btn.textContent = 'Confirmer la suppression'; return; }
+  if (!st.armed) { st.armed = true; btn.classList.add('armed'); btn.textContent = 'Confirmer : les versements passés restent dans tes opérations'; return; }
   S.settings.goals = S.settings.goals.filter(g => g.id !== st.goal.id);
+  S.settings.recurring = S.settings.recurring.filter(r => !(r.kind === 'save' && r.goal === st.goal.id));
   Store.saveSettings(); closeSheet(); render();
 }
 
 /* recurring */
 function recSheet(r) {
   const editing = !!r;
-  r = r ? clone(r) : { id: newId(), label: '', amount: 0, kind: 'in', cat: S.settings.cats.find(c => c.kind === 'in')?.id, day: 1, months: [], start: START, end: '' };
+  r = r ? clone(r) : { id: newId(), label: '', amount: 0, kind: 'in', cat: catsByUse('in')[0]?.id, day: 1, months: [], start: START, end: '' };
   r.months ||= []; r.start ||= START; r.end ||= '';
-  openSheet(`${sheetHead(editing ? 'Modifier' : 'Revenu ou charge fixe')}
-    <div class="seg two" role="group" aria-label="Type"><button data-rkind="out">Charge</button><button data-rkind="in">Revenu</button></div>
-    <div class="field"><label for="rLabel">Libellé</label><input id="rLabel" value="${esc(r.label)}" placeholder="Ex. Loyer, Salaire CEVA, Forfait mobile" autofocus></div>
+  openSheet(`${sheetHead(editing ? 'Modifier' : 'Opération qui revient chaque mois')}
+    <div class="seg" role="group" aria-label="Type"><button data-rkind="in">Revenu</button><button data-rkind="out">Charge</button><button data-rkind="save">Épargne</button></div>
+    <div class="field"><label for="rLabel">Libellé</label><input id="rLabel" value="${esc(r.label)}" placeholder="Ex. Salaire CEVA, Loyer, Forfait mobile" autofocus></div>
     <div class="two-col">
       <div class="field"><label for="rAmount">Montant (€)</label><input id="rAmount" inputmode="decimal" value="${r.amount ? String(r.amount).replace('.', ',') : ''}" placeholder="0,00"></div>
       <div class="field"><label for="rDay">Jour du mois</label><input id="rDay" type="number" min="1" max="31" value="${r.day}"></div>
@@ -735,39 +885,64 @@ function recSheet(r) {
       <div class="field"><label for="rStart">À partir de</label><input id="rStart" type="month" min="${START}" value="${esc(r.start)}"></div>
       <div class="field"><label for="rEnd">Jusqu’à (facultatif)</label><input id="rEnd" type="month" min="${START}" value="${esc(r.end)}"></div>
     </div>
-    <div class="field"><label>Catégorie</label><div class="chips" id="rPicker"></div></div>
+    <div class="field"><label id="rPickLabel">Catégorie</label><div class="chips" id="rPicker"></div></div>
     <div class="err" id="rErr"></div>
-    <div class="sheet-actions"><button class="btn block" data-action="rec-save">Enregistrer</button>
+    <div id="rAsk" hidden></div>
+    <div class="sheet-actions" id="rActions"><button class="btn block" data-action="rec-save">Enregistrer</button>
     ${editing ? '<button class="btn danger block" data-action="rec-del">Supprimer</button>' : ''}
-    ${editing ? '<div class="muted small">Les opérations déjà ajoutées ne changent pas. Les mois ajoutés ici sont rattrapés jusqu’à aujourd’hui.</div>' : ''}</div>`, { type: 'rec', rec: r, editing, armed: false });
+    ${editing ? '<div class="muted small">Les opérations déjà ajoutées ne changent pas.</div>' : ''}</div>`, { type: 'rec', rec: r, editing, armed: false });
   paintRecSheet();
 }
 function paintRecSheet() {
   const r = sheetState.rec;
   document.querySelectorAll('#sheet [data-rkind]').forEach(b => b.setAttribute('aria-pressed', b.dataset.rkind === r.kind));
-  if (!cat(r.cat) || cat(r.cat).kind !== r.kind) r.cat = S.settings.cats.find(c => c.kind === r.kind)?.id;
-  $('#rPicker').innerHTML = S.settings.cats.filter(c => c.kind === r.kind).map(c => `<button class="chip" data-pick-rcat="${esc(c.id)}" aria-pressed="${c.id === r.cat}"><span class="dot" style="background:${esc(c.color)}"></span>${esc(c.name)}</button>`).join('');
+  if (r.kind === 'save') {
+    $('#rPickLabel').textContent = 'Projet';
+    if (!goal(r.goal)) r.goal = S.settings.goals[0]?.id;
+    $('#rPicker').innerHTML = S.settings.goals.length
+      ? S.settings.goals.map(g => `<button class="chip" data-pick-rgoal="${esc(g.id)}" aria-pressed="${g.id === r.goal}">${esc(g.name)}</button>`).join('')
+      : '<span class="muted small">Crée d’abord un projet dans l’onglet Projets.</span>';
+  } else {
+    $('#rPickLabel').textContent = 'Catégorie';
+    if (!cat(r.cat) || cat(r.cat).kind !== r.kind) r.cat = catsByUse(r.kind)[0]?.id;
+    $('#rPicker').innerHTML = catsByUse(r.kind).map(c => `<button class="chip" data-pick-rcat="${esc(c.id)}" aria-pressed="${c.id === r.cat}"><span class="dot" style="background:${esc(c.color)}"></span>${esc(c.name)}</button>`).join('');
+  }
   const all = !r.months.length;
   $('#rMonths').innerHTML = `<button class="chip" data-rmonth="all" aria-pressed="${all}">Tous les mois</button>` +
     MSHORT.map((m, i) => `<button class="chip" data-rmonth="${i + 1}" aria-pressed="${!all && r.months.includes(i + 1)}">${m}</button>`).join('');
 }
 function saveRec() {
-  const r = sheetState.rec;
+  const r = sheetState.rec, err = $('#rErr');
   r.label = $('#rLabel').value.trim();
   r.amount = parseAmount($('#rAmount').value);
   r.day = Math.round(Number($('#rDay').value));
-  if (!r.label) { $('#rErr').textContent = 'Donne un libellé, par exemple « Loyer ».'; return; }
-  if (!(r.amount > 0)) { $('#rErr').textContent = 'Entre un montant supérieur à 0.'; return; }
-  if (!(r.day >= 1 && r.day <= 31)) { $('#rErr').textContent = 'Le jour doit être entre 1 et 31.'; return; }
   r.start = $('#rStart').value || START;
   r.end = $('#rEnd').value || '';
-  if (!/^\d{4}-\d{2}$/.test(r.start) || (r.end && !/^\d{4}-\d{2}$/.test(r.end))) { $('#rErr').textContent = 'Écris les mois sous la forme 2026-09.'; return; }
+  if (!r.label) { err.textContent = 'Donne un libellé, par exemple « Loyer ».'; return; }
+  if (!(r.amount > 0)) { err.textContent = 'Entre un montant supérieur à 0.'; return; }
+  if (!(r.day >= 1 && r.day <= 31)) { err.textContent = 'Le jour doit être entre 1 et 31.'; return; }
+  if (!/^\d{4}-\d{2}$/.test(r.start) || (r.end && !/^\d{4}-\d{2}$/.test(r.end))) { err.textContent = 'Écris les mois sous la forme 2026-09.'; return; }
   if (r.start < START) r.start = START;
-  if (r.end && r.end < r.start) { $('#rErr').textContent = 'Le mois de fin doit venir après le mois de début.'; return; }
+  if (r.end && r.end < r.start) { err.textContent = 'Le mois de fin doit venir après le mois de début.'; return; }
+  if (r.kind === 'save' && !goal(r.goal)) { err.textContent = 'Choisis le projet à alimenter.'; return; }
+  if (r.kind === 'save') delete r.cat; else delete r.goal;
+  err.textContent = '';
+  const missed = missedOccurrences(r);
+  if (!missed.length) { commitRec(true); return; }
+  sheetState.missed = missed;
+  const label = missed.map(k => MSHORT[Number(k.slice(5)) - 1]).join(', ');
+  $('#rActions').hidden = true;
+  const ask = $('#rAsk'); ask.hidden = false;
+  ask.innerHTML = `<div class="notice">« ${esc(r.label)} » aurait déjà dû tomber ${missed.length} fois (${esc(label)}). Tu veux l’ajouter aussi pour ces mois passés ?</div>
+    <div class="sheet-actions" style="margin-top:8px"><button class="btn block" data-action="rec-back-yes">Oui, ajouter ${missed.length > 1 ? 'les mois passés' : 'ce mois passé'}</button>
+    <button class="btn ghost block" data-action="rec-back-no">Non, seulement à partir de maintenant</button></div>`;
+}
+function commitRec(backfill) {
+  const r = sheetState.rec;
   const i = S.settings.recurring.findIndex(x => x.id === r.id);
   if (i >= 0) S.settings.recurring[i] = r; else S.settings.recurring.push(r);
   Store.saveSettings();
-  applyRecurring();
+  if (backfill) applyRecurring(r.id); else skipOccurrences(r, sheetState.missed || []);
   closeSheet(); render();
 }
 function deleteRec(btn) {
@@ -777,11 +952,98 @@ function deleteRec(btn) {
   Store.saveSettings(); closeSheet(); render();
 }
 
+/* first-run wizard */
+const WIZ_IN = [['Salaire', 'salaire'], ['CAF / APL', 'aides'], ['Bourse', 'aides'], ['Aide des parents', 'autres']];
+const WIZ_OUT = [['Loyer', 'logement'], ['Électricité', 'logement'], ['Internet', 'abos'], ['Forfait mobile', 'abos'], ['Mutuelle', 'sante'], ['Transport', 'transport'], ['Streaming', 'abos'], ['Assurance', 'logement']];
+function wizard() {
+  openSheet('', { type: 'wiz', step: 0, incomes: [], charges: [], backfill: true });
+  paintWiz();
+}
+function paintWiz() {
+  const w = sheetState, step = w.step;
+  const dots = `<div class="wiz-dots">${[0, 1, 2].map(i => `<i class="${i <= step ? 'on' : ''}"></i>`).join('')}</div>`;
+  let body;
+  if (step < 2) {
+    const isIn = step === 0, list = isIn ? w.incomes : w.charges, presets = isIn ? WIZ_IN : WIZ_OUT;
+    body = `${sheetHead(isIn ? 'Tes revenus du mois' : 'Tes charges fixes')}${dots}
+      <div class="muted small">${isIn ? 'Ce qui rentre chaque mois. Tu pourras préciser les mois plus tard dans Réglages.' : 'Ce qui sort chaque mois sans que tu choisisses.'}</div>
+      <div class="chips">${presets.map(([l, c]) => `<button class="chip" data-action="wiz-chip" data-label="${esc(l)}" data-cat="${c}">${esc(l)}</button>`).join('')}</div>
+      <div class="field"><label for="wLabel">Libellé</label><input id="wLabel" placeholder="${isIn ? 'Ex. Salaire CEVA' : 'Ex. Loyer'}"></div>
+      <div class="two-col">
+        <div class="field"><label for="wAmount">Montant (€)</label><input id="wAmount" inputmode="decimal" placeholder="0,00"></div>
+        <div class="field"><label for="wDay">Le</label><input id="wDay" type="number" min="1" max="31" value="${isIn ? 28 : 5}"></div>
+      </div>
+      <button class="btn ghost block" data-action="wiz-add">+ Ajouter ${isIn ? 'ce revenu' : 'cette charge'}</button>
+      <div class="wiz-list">${list.map((x, i) => `<div class="wiz-item"><span>${esc(x.label)} · le ${x.day}</span><span><b>${money(x.amount)}</b><button data-action="wiz-del" data-i="${i}" aria-label="Retirer">×</button></span></div>`).join('')}</div>
+      <div class="err" id="wErr"></div>
+      <div class="two-col">${step ? '<button class="btn ghost" data-action="wiz-back">Retour</button>' : '<span></span>'}<button class="btn" data-action="wiz-next">Suivant</button></div>`;
+  } else {
+    const g = w.goal || {};
+    body = `${sheetHead('Ton prochain projet')}${dots}
+      <div class="muted small">Un voyage, un achat… L’app calcule ce qu’il faut mettre de côté chaque mois.</div>
+      <div class="field"><label for="gName">Projet</label><input id="gName" value="${esc(g.name || '')}" placeholder="Ex. Japon été 2027"></div>
+      <div class="two-col">
+        <div class="field"><label for="gTarget">Montant visé (€)</label><input id="gTarget" inputmode="decimal" placeholder="2500" value="${g.target || ''}"></div>
+        <div class="field"><label for="gDeadline">Avant (mois)</label><input id="gDeadline" type="month" min="${mkey(todayStr())}" value="${esc(g.deadline || '')}" placeholder="2027-06"></div>
+      </div>
+      <input id="gInitial" type="hidden" value="0">
+      <label class="small" style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="wAuto" checked> Mettre de côté automatiquement le 1er de chaque mois</label>
+      <div class="small" id="gHint"></div>
+      <label class="small" style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="wBack" ${w.backfill ? 'checked' : ''}> Ajouter aussi tes revenus et charges depuis septembre 2026</label>
+      <div class="err" id="wErr"></div>
+      <div class="two-col"><button class="btn ghost" data-action="wiz-back">Retour</button><button class="btn" data-action="wiz-finish">Terminer</button></div>
+      <button class="link" data-action="wiz-finish" data-skip="1" style="justify-self:center">Passer cette étape</button>`;
+  }
+  $('#sheet').innerHTML = body;
+  if (step === 2) goalHint();
+  setTimeout(() => $(step === 2 ? '#gName' : '#wAmount')?.focus(), 30);
+}
+/* Add the filled line of the current step; returns false when the fields are invalid but not empty */
+function wizTake() {
+  const w = sheetState, label = $('#wLabel').value.trim(), raw = $('#wAmount').value.trim();
+  if (!label && !raw) return true;
+  const amount = parseAmount(raw), day = Math.round(Number($('#wDay').value));
+  if (!label) { $('#wErr').textContent = 'Donne un libellé, ou touche une suggestion.'; return false; }
+  if (!(amount > 0)) { $('#wErr').textContent = 'Entre un montant supérieur à 0.'; return false; }
+  if (!(day >= 1 && day <= 31)) { $('#wErr').textContent = 'Le jour doit être entre 1 et 31.'; return false; }
+  (w.step === 0 ? w.incomes : w.charges).push({ label, amount, day, cat: w.pickedCat || null });
+  w.pickedCat = null;
+  return true;
+}
+function wizFinish(skip) {
+  const w = sheetState;
+  const backfill = $('#wBack')?.checked ?? true, wantAuto = !skip && !!$('#wAuto')?.checked;
+  let g = null, autoAmount = 0;
+  if (!skip) {
+    const name = $('#gName').value.trim(), target = parseAmount($('#gTarget').value), deadline = $('#gDeadline').value || '';
+    if (name || $('#gTarget').value.trim()) {
+      if (!name) { $('#wErr').textContent = 'Donne un nom à ton projet, ou touche « Passer cette étape ».'; return; }
+      if (!(target > 0)) { $('#wErr').textContent = 'Indique le montant visé, par exemple 2500.'; return; }
+      g = { id: newId(), name, target, deadline, initial: 0 };
+      if ($('#wAuto').checked) autoAmount = suggestPerMonth(target, 0, deadline) || 0;
+    }
+  }
+  const add = (x, kind) => {
+    const c = cat(x.cat)?.kind === kind ? x.cat : catsByUse(kind)[0]?.id;
+    const r = { id: newId(), label: x.label, amount: x.amount, kind, cat: c, day: x.day, months: [], start: START, end: '' };
+    S.settings.recurring.push(r);
+    if (!backfill) skipOccurrences(r, missedOccurrences(r));
+  };
+  w.incomes.forEach(x => add(x, 'in'));
+  w.charges.forEach(x => add(x, 'out'));
+  if (g) { S.settings.goals.push(g); setAutoSave(g, autoAmount, 1); }
+  Store.saveSettings();
+  applyRecurring();
+  closeSheet(); S.view = 'mois'; S.month = mkey(todayStr()) < START ? START : mkey(todayStr()); render();
+  if (g && !autoAmount && wantAuto) toast('Projet créé. Ajoute une date pour activer l’épargne auto.');
+}
+
 /* ---------- events ---------- */
 document.addEventListener('click', e => {
   const t = e.target.closest('button, [data-close]');
   if (!t) return;
   if (t.hasAttribute('data-close')) { closeSheet(); return; }
+  if (t.id === 'toastUndo') { const u = toastUndo; $('#toast').hidden = true; toastUndo = null; u?.(); return; }
   if (t.id === 'prev') { if (S.month > START) { S.month = addMonths(S.month, -1); render(); } return; }
   if (t.id === 'next') { S.month = addMonths(S.month, 1); render(); return; }
   if (t.id === 'gear') { S.view = 'reglages'; render(); window.scrollTo(0, 0); return; }
@@ -794,6 +1056,7 @@ document.addEventListener('click', e => {
     if (t.dataset.pickGoal) { sheetState.goal = t.dataset.pickGoal; paintTxSheet(); return; }
     if (t.dataset.rkind) { sheetState.rec.kind = t.dataset.rkind; paintRecSheet(); return; }
     if (t.dataset.pickRcat) { sheetState.rec.cat = t.dataset.pickRcat; paintRecSheet(); return; }
+    if (t.dataset.pickRgoal) { sheetState.rec.goal = t.dataset.pickRgoal; paintRecSheet(); return; }
     if (t.dataset.rmonth) {
       const r = sheetState.rec;
       if (t.dataset.rmonth === 'all') r.months = [];
@@ -830,10 +1093,23 @@ document.addEventListener('click', e => {
     case 'edit-rec': recSheet(S2.recurring.find(r => r.id === t.dataset.id)); break;
     case 'rec-save': saveRec(); break;
     case 'rec-del': deleteRec(t); break;
+    case 'rec-back-yes': commitRec(true); break;
+    case 'rec-back-no': commitRec(false); break;
+    case 'goal-use-sugg': $('#gAuto').value = t.dataset.v; break;
+    case 'wizard': wizard(); break;
+    case 'wiz-chip': $('#wLabel').value = t.dataset.label; sheetState.pickedCat = t.dataset.cat; $('#wAmount').focus(); break;
+    case 'wiz-add': if (wizTake()) paintWiz(); break;
+    case 'wiz-del': (sheetState.step === 0 ? sheetState.incomes : sheetState.charges).splice(Number(t.dataset.i), 1); paintWiz(); break;
+    case 'wiz-next': if (wizTake()) { sheetState.step++; paintWiz(); } break;
+    case 'wiz-back':
+      if (sheetState.step === 2) { sheetState.goal = { name: $('#gName').value, target: $('#gTarget').value, deadline: $('#gDeadline').value }; sheetState.backfill = $('#wBack').checked; }
+      sheetState.step--; paintWiz(); break;
+    case 'wiz-finish': wizFinish(!!t.dataset.skip); break;
     case 'export': exportData(); break;
   }
 });
 function exportData() {
+  S.settings.lastExport = todayStr(); Store.persistLocal();
   const blob = new Blob([JSON.stringify({ app: 'cap-epargne', version: 1, exported: new Date().toISOString(), settings: S.settings, months: S.months }, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -854,6 +1130,9 @@ document.addEventListener('change', async e => {
     S.backupMsg = 'Ce fichier n’est pas une sauvegarde Cap Épargne valide.';
   }
   render();
+});
+document.addEventListener('input', e => {
+  if (sheetState && ['gTarget', 'gInitial', 'gDeadline'].includes(e.target.id)) goalHint();
 });
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && sheetState) closeSheet();
