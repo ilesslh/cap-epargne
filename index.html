@@ -669,7 +669,7 @@ function readPdfStatement(lines) {
     } else if (cur) {
       if (SKIP.test(norm(text))) { close(); continue; }
       if (!cur.amount && amount) { cur.amount = amount; cur.kind = kind; }
-      else if (!money.length && text && cur.raw.length < 70 && !/^(carte|card|ref|reference)/i.test(text)) cur.raw += ' ' + text;
+      else if (!money.length && text && cur.raw.length < 70 && !/^(carte|card|ref|reference)[\s:.]/i.test(text)) cur.raw += ' ' + text;
     }
   }
   close();
