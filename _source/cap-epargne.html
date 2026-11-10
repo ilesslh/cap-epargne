@@ -214,7 +214,7 @@ h2 { font-family: var(--font-display); font-weight: 700; font-size: 18px; margin
 </nav>
 <button class="fab" id="fab" aria-label="Ajouter une opération">+</button>
 
-<input type="file" id="csvFile" accept=".csv,text/csv,text/plain" hidden>
+<input type="file" id="csvFile" accept=".pdf,.csv,application/pdf,text/csv,text/plain" hidden>
 <div class="toast" id="toast" role="status" hidden><span id="toastMsg"></span><button id="toastUndo">Annuler</button></div>
 <div class="sheet-wrap" id="sheetWrap" hidden>
   <div class="backdrop" data-close></div>
@@ -514,7 +514,7 @@ function parseDate(s) {
   return m ? `${m[3].length === 2 ? '20' + m[3] : m[3]}-${pad(m[2])}-${pad(m[1])}` : null;
 }
 const parseMoney = s => {
-  const v = String(s ?? '').replace(/[\s\u00a0\u202f€]|EUR/gi, '');
+  const v = String(s ?? '').replace(/[\s\u00a0\u202f€]|EUR/gi, '').replace(/−/g, '-');
   if (!v) return NaN;
   return parseFloat(/,\d{1,2}$/.test(v) ? v.replace(/\./g, '').replace(',', '.') : v.replace(/,/g, ''));
 };
@@ -549,6 +549,122 @@ function readStatement(text) {
   }
   return out;
 }
+/* ---------- PDF statements: pdf.js extracts positioned text on this device, rows are rebuilt and read by column ---------- */
+const PDFJS = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
+let pdfjsReady = null;
+const loadScript = src => new Promise((ok, ko) => { const s = document.createElement('script'); s.src = src; s.onload = ok; s.onerror = ko; document.head.appendChild(s); });
+/* The worker script is loaded in the page so pdf.js runs without a separate worker origin */
+function loadPdfjs() {
+  return pdfjsReady ||= loadScript(PDFJS + 'pdf.worker.min.js').then(() => loadScript(PDFJS + 'pdf.min.js')).then(() => window.pdfjsLib)
+    .catch(e => { pdfjsReady = null; throw e; });
+}
+async function pdfLines(buf) {
+  const lib = await loadPdfjs();
+  const doc = await lib.getDocument({ data: new Uint8Array(buf), isEvalSupported: false }).promise;
+  const lines = [];
+  for (let p = 1; p <= doc.numPages; p++) {
+    const content = await (await doc.getPage(p)).getTextContent(), rows = [];
+    for (const it of content.items) {
+      if (!it.str?.trim()) continue;
+      const x = it.transform[4], y = it.transform[5];
+      let row = rows.find(r => Math.abs(r.y - y) < 3);
+      if (!row) rows.push(row = { y, cells: [] });
+      row.cells.push({ x, w: it.width || 0, s: it.str });
+    }
+    rows.sort((a, b) => b.y - a.y);
+    for (const r of rows) {
+      r.cells.sort((a, b) => a.x - b.x);
+      const cells = [];
+      for (const c of r.cells) {
+        const last = cells[cells.length - 1], gap = last ? c.x - (last.x + last.w) : 99;
+        if (gap < 2.5) { last.s += (gap > 0.8 ? ' ' : '') + c.s; last.w = c.x + c.w - last.x; }
+        else cells.push({ ...c });
+      }
+      lines.push(cells.map(c => ({ x: c.x, w: c.w, s: c.s.replace(/\s+/g, ' ').trim() })));
+    }
+  }
+  return lines;
+}
+const MONTH_NUM = { janv: 1, jan: 1, janvier: 1, fevr: 2, fev: 2, fevrier: 2, feb: 2, mars: 3, mar: 3, avr: 4, avril: 4, apr: 4, mai: 5, may: 5, juin: 6, jun: 6, juil: 7, juillet: 7, jul: 7, aout: 8, aug: 8, sept: 9, sep: 9, septembre: 9, oct: 10, octobre: 10, nov: 11, novembre: 11, dec: 12, decembre: 12 };
+const MONEY = /^[-−+]?\s?€?\s?\d{1,3}(?:[   .,]?\d{3})*[.,]\d{2}\s?€?$/;
+/* Date at the start of a row: 06/10/2026, 06.10 (year from the statement), 1 nov. 2026, Nov 1, 2026 */
+function leadDate(text, end) {
+  const t = deaccent(text).toLowerCase(), ey = Number(end.slice(0, 4)), em = Number(end.slice(5, 7));
+  const make = (d, m, y) => {
+    if (!(m >= 1 && m <= 12 && d >= 1 && d <= 31)) return null;
+    if (!y) y = m > em ? ey - 1 : ey;
+    else if (y < 100) y += 2000;
+    return `${y}-${pad(m)}-${pad(d)}`;
+  };
+  let m = t.match(/^(\d{1,2})[/.](\d{1,2})(?:[/.](\d{2,4}))?(?![\d,])/);
+  if (m) return { date: make(+m[1], +m[2], m[3] && +m[3]), len: m[0].length };
+  m = t.match(/^(\d{1,2})(?:er)? ([a-z]{3,9})\.? (\d{4})/);
+  if (m && MONTH_NUM[m[2]]) return { date: make(+m[1], MONTH_NUM[m[2]], +m[3]), len: m[0].length };
+  m = t.match(/^([a-z]{3,9})\.? (\d{1,2}),? (\d{4})/);
+  if (m && MONTH_NUM[m[1]]) return { date: make(+m[2], MONTH_NUM[m[1]], +m[3]), len: m[0].length };
+  return null;
+}
+/* Rows (arrays of {x, w, s}) -> same shape as readStatement, or null when no operation is found */
+function readPdfStatement(lines) {
+  const norm = s => deaccent(s).toLowerCase().replace(/[()€.:*]/g, '').replace(/\s+euros?$/, '').trim();
+  let end = '';
+  for (const l of lines) {
+    const txt = l.map(c => c.s).join(' ');
+    for (const m of txt.matchAll(/\b(\d{1,2})[/.](\d{1,2})[/.](20\d{2})\b/g)) { const d = `${m[3]}-${pad(m[2])}-${pad(m[1])}`; if (d > end && d.slice(5, 7) <= '12') end = d; }
+    for (const m of deaccent(txt).toLowerCase().matchAll(/\b(\d{1,2}) ([a-z]{3,9})\.? (20\d{2})\b/g)) if (MONTH_NUM[m[2]]) { const d = `${m[3]}-${pad(MONTH_NUM[m[2]])}-${pad(m[1])}`; if (d > end) end = d; }
+  }
+  end ||= todayStr();
+  const COL = {
+    out: /^(debit|debits|debit eur|money out|argent sortant|sortant|sorties?|retraits?|paid out)$/,
+    in: /^(credit|credits|credit eur|money in|argent entrant|entrant|entrees?|versements?|paid in)$/,
+    bal: /^(solde|balance|solde eur)$/
+  };
+  const SKIP = /^(ancien solde|nouveau solde|solde|total|sous-total|report|balance|page \d)/;
+  let cols = null, cur = null, prevBal = null;
+  const out = [];
+  const close = () => { if (cur?.amount > 0 && !SKIP.test(norm(cur.raw))) out.push(cur); cur = null; };
+  const center = c => c.x + c.w / 2;
+  for (const l of lines) {
+    const found = {};
+    for (const c of l) for (const k in COL) if (COL[k].test(norm(c.s))) found[k] = center(c);
+    if (found.out !== undefined && found.in !== undefined) { cols = found; close(); continue; }
+    /* leading date cells first: "06.10" would otherwise read as an amount */
+    const lead = [];
+    for (const c of l) { if (lead.length < 2 && leadDate(c.s, end)?.len === c.s.length) lead.push(c); else break; }
+    const rest = l.slice(lead.length);
+    const money = rest.filter(c => MONEY.test(c.s));
+    const words = rest.filter(c => !MONEY.test(c.s));
+    const text = words.map(c => c.s).join(' ');
+    /* amount and balance of this row, by column when the header was seen, else by sign or balance change */
+    let amount = null, kind = null, bal = null;
+    for (const c of money) {
+      const v = parseMoney(c.s);
+      if (!Number.isFinite(v)) continue;
+      let col = null;
+      if (cols) col = Object.keys(cols).reduce((a, k) => Math.abs(cols[k] - center(c)) < Math.abs(cols[a] - center(c)) ? k : a);
+      if (col === 'bal') bal = v;
+      else if (amount === null) { amount = Math.abs(v); kind = col || (/^[-−]/.test(c.s) ? 'out' : /^\+/.test(c.s) ? 'in' : null); }
+      else if (!cols) bal = v;
+    }
+    if (amount !== null && !kind) kind = bal !== null && prevBal !== null ? (bal >= prevBal ? 'in' : 'out') : 'out';
+    if (bal !== null) prevBal = bal;
+    const d = leadDate(lead.length ? lead[0].s : text, end);
+    if (d?.date) {
+      close();
+      let raw = lead.length ? text : text.slice(d.len).trim();
+      const d2 = lead.length ? null : leadDate(raw, end);
+      if (d2?.date) raw = raw.slice(d2.len).trim();
+      cur = { date: d.date, raw, amount: amount || 0, kind: kind || 'out', type: '' };
+    } else if (cur) {
+      if (SKIP.test(norm(text))) { close(); continue; }
+      if (!cur.amount && amount) { cur.amount = amount; cur.kind = kind; }
+      else if (!money.length && text && cur.raw.length < 70 && !/^(carte|card|ref|reference)/i.test(text)) cur.raw += ' ' + text;
+    }
+  }
+  close();
+  return out.length ? out.map(o => ({ ...o, amount: Math.round(o.amount * 100) / 100, raw: o.raw.trim() || 'Opération' })) : null;
+}
+
 const INTERNAL = /top-?up|recharge|coffre|vault|pocket|livret|exchange|change de devise|virement interne|revolut|compte (courant|joint|epargne)/;
 /* Drop lines already imported, untick probable duplicates of manual/automatic entries and transfers between own accounts */
 function prepareImport(list) {
@@ -645,7 +761,7 @@ function viewMois() {
   const tx = [...T.tx].sort((a, b) => b.date.localeCompare(a.date) || (b.ts || 0) - (a.ts || 0));
   if (k <= cur || tx.length) {
     html += `<section class="card"><div class="section-head"><h2>Opérations</h2><span class="muted small">${tx.length} ce mois · <button class="link small" data-action="import-csv">Importer un relevé</button></span></div>`;
-    if (!tx.length) html += `<div class="empty"><div>Aucune opération en ${esc(monthLabel(k))}.</div><button class="btn ghost" data-action="add">Ajouter une dépense</button><button class="link" data-action="import-csv">ou importer le relevé CSV de ta banque</button></div>`;
+    if (!tx.length) html += `<div class="empty"><div>Aucune opération en ${esc(monthLabel(k))}.</div><button class="btn ghost" data-action="add">Ajouter une dépense</button><button class="link" data-action="import-csv">ou importer le relevé de ta banque (PDF ou CSV)</button></div>`;
     else {
       html += '<div class="list">';
       let last = '';
@@ -896,10 +1012,10 @@ function viewReglages() {
   }
   const nRules = Object.keys(s.rules || {}).length;
   html += `<section class="card"><h2>Importer un relevé bancaire</h2>
-    <div class="small">Exporte tes opérations en CSV depuis ta banque, puis importe le fichier ici. Il est lu sur ton appareil, rien n’est envoyé ailleurs.</div>
-    <div class="small muted"><b>Revolut</b> : Accueil, touche ton compte, « … » puis Relevé, format Excel/CSV.<br><b>Crédit Agricole</b> : sur le site web (pas l’appli), Mes comptes puis Télécharger les opérations, format CSV ou tableur.</div>
+    <div class="small">Importe le relevé PDF (ou l’export CSV) de ta banque. Le fichier est lu sur ton appareil, rien n’est envoyé ailleurs.</div>
+    <div class="small muted"><b>Revolut</b> : touche ton compte, « … » puis Relevé, format PDF ou Excel/CSV.<br><b>Crédit Agricole</b> : Mes comptes puis e-Documents (relevés PDF), ou Télécharger les opérations en CSV sur le site web.</div>
     <div class="small muted">Les doublons et les virements entre tes comptes sont décochés d’office. Chaque catégorie que tu corriges est retenue pour les prochains imports${nRules ? ` (${nRules} règle${nRules > 1 ? 's' : ''} apprise${nRules > 1 ? 's' : ''} · <button class="link small" data-action="rules-reset">oublier</button>)` : ''}.</div>
-    <button class="btn" data-action="import-csv">Choisir un fichier CSV</button></section>`;
+    <button class="btn" data-action="import-csv">Choisir un relevé (PDF ou CSV)</button></section>`;
   html += `<section class="card"><div class="section-head"><h2>Catégories de revenus</h2><button class="link" data-action="new-cat" data-kind="in">+ Catégorie</button></div><div class="chips">`;
   for (const c of s.cats.filter(c => c.kind === 'in')) html += `<button class="chip" data-action="edit-cat" data-id="${esc(c.id)}"><span class="dot" style="background:${esc(c.color)}"></span>${esc(c.name)}</button>`;
   html += `</div><div class="muted small">Les catégories de dépenses se gèrent dans l’onglet Budgets.</div></section>`;
@@ -1439,13 +1555,20 @@ document.addEventListener('change', async e => {
   }
   if (el.id !== 'csvFile' || !el.files[0]) return;
   const file = el.files[0]; el.value = '';
-  let text;
-  try {
-    const buf = await file.arrayBuffer();
+  let buf, list;
+  try { buf = await file.arrayBuffer(); } catch (err) { toast('Impossible de lire ce fichier.'); return; }
+  if (/\.pdf$/i.test(file.name) || file.type === 'application/pdf') {
+    toast('Lecture du relevé PDF…');
+    try { list = readPdfStatement(await pdfLines(buf)); }
+    catch (err) { toast(err?.name === 'PasswordException' ? 'Ce PDF est protégé par un mot de passe.' : 'Impossible de lire ce PDF. Vérifie ta connexion : le lecteur PDF se charge au premier import.'); return; }
+    if (!list) { toast('Aucune opération trouvée dans ce PDF. Essaie l’export CSV de ta banque.'); return; }
+  } else {
+    let text;
     try { text = new TextDecoder('utf-8', { fatal: true }).decode(buf); } catch (err) { text = new TextDecoder('windows-1252').decode(buf); }
-  } catch (err) { toast('Impossible de lire ce fichier.'); return; }
-  const list = readStatement(text.replace(/^﻿/, ''));
-  if (!list) { toast('Fichier non reconnu : exporte ton relevé au format CSV depuis ta banque.'); return; }
+    list = readStatement(text.replace(/^\ufeff/, ''));
+    if (!list) { toast('Fichier non reconnu : importe le relevé PDF ou CSV de ta banque.'); return; }
+  }
+  $('#toast').hidden = true;
   importSheet(prepareImport(list), file.name);
 });
 document.addEventListener('keydown', e => {

@@ -122,7 +122,7 @@ if ('serviceWorker' in navigator) window.addEventListener('load', () => navigato
 """, encoding="utf-8")
 
 (out / "sw.js").write_text("""// Cache the app shell so Cap Épargne opens offline. Bump VERSION on each release.
-const VERSION = 'cap-epargne-v3';
+const VERSION = 'cap-epargne-v4';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
 
 self.addEventListener('install', e => {
