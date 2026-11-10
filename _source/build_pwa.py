@@ -39,10 +39,12 @@ s = rep(s,
 
 # 3. Export / import handlers
 s = rep(s,
-"""    case 'rules-reset': S2.rules = {}; Store.saveSettings(); render(); toast('Règles de catégories oubliées.'); break;
+"""      closeSheet(); render(); break;
+    }
   }
 });""",
-"""    case 'rules-reset': S2.rules = {}; Store.saveSettings(); render(); toast('Règles de catégories oubliées.'); break;
+"""      closeSheet(); render(); break;
+    }
     case 'export': exportData(); break;
   }
 });
@@ -122,7 +124,7 @@ if ('serviceWorker' in navigator) window.addEventListener('load', () => navigato
 """, encoding="utf-8")
 
 (out / "sw.js").write_text("""// Cache the app shell so Cap Épargne opens offline. Bump VERSION on each release.
-const VERSION = 'cap-epargne-v4';
+const VERSION = 'cap-epargne-v5';
 const SHELL = ['./', './index.html', './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'];
 
 self.addEventListener('install', e => {
