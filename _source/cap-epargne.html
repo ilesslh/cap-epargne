@@ -366,7 +366,7 @@ function applyRecurring(only) {
     if (only && r.id !== only) continue;
     for (const k of missedOccurrences(r)) {
       const m = getMonth(k), tx = recTx(r, k);
-      if (!m.tx.some(x => x.id === tx.id)) m.tx.push(tx);
+      if (!m.tx.some(x => x.id === tx.id)) { m.tx.push(tx); payYourself(tx); }
       m.rec.push(r.id); Store.saveMonth(k);
     }
   }
@@ -421,6 +421,40 @@ function totals(k) {
     else if (t.kind === 'save') save += t.amount;
   }
   return { inc, out, save, rest: inc - out - save, byCat, tx };
+}
+/* Pay yourself first: a share of each salary goes to a project the day it is booked */
+function pyfGoal() {
+  const p = S.settings.pyf;
+  if (!p?.pct) return null;
+  if (p.goal !== 'auto') return goal(p.goal) || null;
+  const open = S.settings.goals.filter(g => goalSaved(g) < g.target);
+  return open.find(g => g.emergency) || [...open].sort((a, b) => (a.deadline || '9999').localeCompare(b.deadline || '9999'))[0] || null;
+}
+function payYourself(t) {
+  if (t.kind !== 'in' || t.cat !== 'salaire') return null;
+  const g = pyfGoal(), m = getMonth(mkey(t.date)), id = 'p-' + t.id;
+  if (!g || m.tx.some(x => x.id === id)) return null;
+  const amount = Math.round(t.amount * S.settings.pyf.pct) / 100;
+  if (!(amount > 0)) return null;
+  const s = { id, kind: 'save', amount, date: t.date, goal: g.id, note: `Payé d’abord : ${S.settings.pyf.pct} % du salaire`, from: t.id, ts: Date.now() };
+  m.tx.push(s);
+  return s;
+}
+/* Emergency fund: three months of spending (average of the last complete months, at least the fixed charges) */
+function emergencyTarget() {
+  const cur = mkey(todayStr());
+  const ks = Object.keys(S.months).filter(k => k < cur && (S.months[k].tx || []).some(t => t.kind === 'out')).sort().slice(-3);
+  const avg = ks.length ? ks.reduce((a, k) => a + totals(k).out, 0) / ks.length : 0;
+  const fixed = S.settings.recurring.filter(r => r.kind === 'out').reduce((a, r) => a + r.amount * (r.months?.length || 12) / 12, 0);
+  return Math.ceil(Math.max(avg, fixed) * 3 / 50) * 50;
+}
+/* Average spending per category over the last (up to 3) complete months that have expenses */
+function spendingAverages() {
+  const cur = mkey(todayStr());
+  const ks = Object.keys(S.months).filter(k => k < cur && (S.months[k].tx || []).some(t => t.kind === 'out')).sort().slice(-3);
+  const avg = {};
+  for (const k of ks) for (const [c, v] of Object.entries(totals(k).byCat)) avg[c] = (avg[c] || 0) + v / ks.length;
+  return { months: ks, avg };
 }
 const roundupsOf = (gid, k) => (S.months[k]?.tx || []).reduce((a, t) => a + (t.ru?.goal === gid ? t.ru.amount : 0), 0);
 function goalPlan(g) {
@@ -807,7 +841,18 @@ function viewMois() {
            ${up.length ? `<div class="small" style="opacity:.9">Fin de mois prévue : <b>${money0(projected)}</b> après ${up.length} opération${up.length > 1 ? 's' : ''} à venir</div>` : ''}`
         : `<div class="daily warn"><b>${money0(projected)}</b><span>prévu en fin de mois : tu es dans le rouge, freine les dépenses</span></div>`;
     }
-    html = `<section class="card hero">
+    const real = k === cur ? realBalance() : null;
+    html = real ? `<section class="card hero">
+      <div class="eyebrow">Sur tes comptes${real.estimated ? ' (estimé)' : ''}</div>
+      <div class="big">${money(real.total)}</div>
+      ${real.reserved ? `<div class="small" style="opacity:.92">dont ${money0(real.reserved)} réservés à tes projets · <b>${money0(real.total - real.reserved)}</b> vraiment libres</div>` : ''}
+      ${extra}
+      <div class="stats">
+        <div class="stat"><small>Reste à vivre</small><b>${money0(T.rest)}</b></div>
+        <div class="stat"><small>Dépenses</small><b>${money0(T.out)}</b></div>
+        <div class="stat"><small>Mis de côté</small><b>${money0(T.save)}</b></div>
+      </div>
+    </section>` : `<section class="card hero">
       <div class="eyebrow">Reste à vivre en ${esc(mName)}</div>
       <div class="big">${money(T.rest)}</div>
       ${extra}
@@ -818,6 +863,7 @@ function viewMois() {
       </div>
     </section>`;
   }
+  if (k === cur) html += statementReminder() + budgetAlerts(k);
   if (k >= cur && s.accounts?.length) html += accountsCard();
   if (fresh) html += `
   <section class="card">
@@ -855,6 +901,37 @@ function viewMois() {
   return html;
 }
 
+/* Money on the accounts now: last statements, plus what was booked since (estimated when entries have no account yet) */
+function realBalance() {
+  const accs = (S.settings.accounts || []).map(a => accBalance(a)).filter(Boolean);
+  if (!accs.length) return null;
+  let total = accs.reduce((a, b) => a + b.now, 0);
+  const lastEnd = accs.reduce((a, b) => b.last.end > a ? b.last.end : a, '');
+  let estimated = false;
+  for (const m of Object.values(S.months)) for (const t of m.tx || []) {
+    if (!t.acc && t.date > lastEnd && t.date <= todayStr() && (t.kind === 'in' || t.kind === 'out')) { total += signed(t); estimated = true; }
+  }
+  const reserved = S.settings.goals.reduce((a, g) => a + goalSaved(g), 0);
+  return { total: Math.round(total * 100) / 100, reserved, estimated };
+}
+/* Early in the month, ask for last month's statement on accounts that stop before its end */
+function statementReminder() {
+  const t = todayStr(), prevEnd = `${addMonths(mkey(t), -1)}-${pad(lastDay(addMonths(mkey(t), -1)))}`;
+  if (Number(t.slice(8)) < 3) return '';
+  const late = (S.settings.accounts || []).filter(a => !(a.stmts || []).some(st => st.end >= addMonths(mkey(t), -1) + '-25'));
+  if (!late.length) return '';
+  const pm = MONTHS[Number(prevEnd.slice(5, 7)) - 1];
+  return `<section class="card"><div class="small">Importe ton relevé ${/^[aeiou]/.test(pm) ? 'd’' : 'de '}<b>${esc(pm)}</b> pour ${esc(late.map(a => a.name).join(' et '))} : l’appli vérifiera tes soldes au centime.</div>
+    <button class="btn ghost" data-action="import-csv">Importer le relevé</button></section>`;
+}
+/* Categories at 80 % of their ceiling or above this month */
+function budgetAlerts(k) {
+  const T = totals(k);
+  const hot = S.settings.cats.filter(c => c.kind === 'out' && c.budget && (T.byCat[c.id] || 0) >= c.budget * .8);
+  if (!hot.length) return '';
+  return `<section class="card"><div class="section-head"><h2>Alertes budget</h2><button class="link" data-action="go" data-view="budgets">Voir</button></div>
+    ${hot.map(c => { const sp = T.byCat[c.id] || 0, st = budgetState(sp, c.budget); return `<div class="acc-line"><span><span class="dot" style="display:inline-block;background:${esc(c.color)};margin-right:8px"></span>${esc(c.name)}</span><span class="state ${st.cls}">${Math.round(sp / c.budget * 100)} % · ${esc(st.label)}</span></div>`; }).join('')}</section>`;
+}
 /* Bank balances from the last statement of each account, with every gap between statements and the app */
 function accountsCard() {
   let total = 0, known = 0, rows = '', warns = '';
@@ -870,7 +947,7 @@ function accountsCard() {
       if (prev && prev.close !== null && st.open !== null && Math.abs(prev.close - st.open) >= 0.01) warns += `<div class="notice small gap-warn"><b>Trou entre deux relevés</b> sur ${esc(a.name)} : le relevé finit à ${money(prev.close)} le ${esc(shortDate(prev.end))} mais le suivant repart de ${money(st.open)}. Un relevé intermédiaire manque peut-être.</div>`;
     });
   }
-  return `<section class="card"><div class="section-head"><h2>Tes comptes</h2>${known > 1 ? `<span class="muted small">Total ${money0(total)}</span>` : ''}</div>
+  return `<section class="card"><div class="section-head"><h2>Tes comptes</h2>${known > 1 && S.month > mkey(todayStr()) ? `<span class="muted small">Total ${money0(total)}</span>` : ''}</div>
     <div class="list" style="gap:10px">${rows}</div>${warns || (known ? '<div class="state ok">Tes relevés et l’appli sont d’accord, au centime près.</div>' : '')}</section>`;
 }
 
@@ -886,7 +963,8 @@ function viewBudgets() {
     <div class="bar ${st.cls}"><i style="width:${Math.min(100, budgetedSpent / totalBudget * 100)}%"></i></div>
     <div class="state ${st.cls}">${esc(st.label)}</div>`
     : `<div class="muted">Aucun plafond fixé. Touche une catégorie pour lui donner un budget mensuel.</div>`}
-  </section><section class="card"><div class="section-head"><h2>Par catégorie</h2><button class="link" data-action="new-cat" data-kind="out">+ Catégorie</button></div><div class="list">`;
+  </section>${spendingAverages().months.length ? `<section class="card"><div class="small">${totalBudget ? 'Tes dépenses ont changé ? Recalcule tes plafonds' : 'Fixe tes plafonds en un geste'} d’après ce que tu as vraiment dépensé ces derniers mois.</div>
+    <button class="btn ghost" data-action="budget-auto">${totalBudget ? 'Recalculer mes plafonds' : 'Proposer mes plafonds'}</button></section>` : ''}<section class="card"><div class="section-head"><h2>Par catégorie</h2><button class="link" data-action="new-cat" data-kind="out">+ Catégorie</button></div><div class="list">`;
   const sorted = [...cats].sort((a, b) => (b.budget ? 1 : 0) - (a.budget ? 1 : 0) || (T.byCat[b.id] || 0) - (T.byCat[a.id] || 0));
   for (const c of sorted) {
     const spent = T.byCat[c.id] || 0, s = budgetState(spent, c.budget);
@@ -912,11 +990,27 @@ function viewProjets() {
     <div><b style="color:var(--fg)">Aucun projet pour l’instant</b></div>
     <div>Un voyage au Japon, un week-end à Lisbonne, un nouvel ordi… Donne un montant et une date, l’app calcule ton effort mensuel.</div>
     <button class="btn" data-action="new-goal">Créer un projet</button></div></section>`;
-  for (const g of goals) {
+  /* Pay yourself first, then the emergency fund offer, then projects with the emergency fund on top */
+  const pyf = S.settings.pyf, pg = pyfGoal();
+  html += `<section class="card"><div class="section-head"><h2>Payer-toi d’abord</h2><button class="link" data-action="pyf">${pyf?.pct ? 'Modifier' : 'Activer'}</button></div>
+    <div class="small">${pyf?.pct
+      ? `<b>${pyf.pct} %</b> de chaque salaire part ${pg ? `vers <b>${esc(pg.name)}</b>` : 'vers tes projets (aucun projet en cours pour l’instant)'} le jour où il tombe, avant que tu dépenses.${pyf.goal === 'auto' ? ' Fonds d’urgence d’abord, puis le projet à la date la plus proche.' : ''}`
+      : 'Le jour où ton salaire tombe, l’appli met de côté un pourcentage fixe vers tes projets. Ce que tu ne vois pas, tu ne le dépenses pas.'}</div></section>`;
+  if (!goals.some(g => g.emergency)) {
+    const target = emergencyTarget();
+    if (target > 0) html += `<section class="card"><h2>Fonds d’urgence</h2>
+      <div class="small">Une réserve de 3 mois de dépenses (≈ <b>${money0(target)}</b> pour toi) pour qu’une panne ou une facture imprévue ne touche jamais à tes voyages. À remplir en priorité.</div>
+      <button class="btn ghost" data-action="em-create">Créer mon fonds d’urgence</button></section>`;
+  }
+  for (const g of [...goals].sort((a, b) => (b.emergency ? 1 : 0) - (a.emergency ? 1 : 0))) {
     const sv = goalSaved(g), p = goalPlan(g), pct = g.target ? Math.min(100, sv / g.target * 100) : 0;
     const auto = autoSaveOf(g.id);
     let plan;
-    if (p.left <= 0) plan = `<span class="state ok">Objectif atteint, bon voyage !</span>`;
+    if (g.emergency && p.left > 0) {
+      const t = emergencyTarget();
+      plan = `<span class="small"><span class="tag" style="margin:0 6px 0 0">prioritaire</span>Il reste <b>${money0(p.left)}</b> avant d’être à l’abri${t && Math.abs(t - g.target) > g.target * .1 ? ` · <button class="link small" data-action="em-update" data-id="${esc(g.id)}">ajuster à ${money0(t)} (3 mois)</button>` : ''}</span>`;
+    }
+    else if (p.left <= 0) plan = `<span class="state ok">${g.emergency ? 'Fonds d’urgence complet, tu es à l’abri.' : 'Objectif atteint, bon voyage !'}</span>`;
     else if (p.months === null) plan = `<span class="muted small">Il reste ${money0(p.left)} · ajoute une date pour un plan mensuel</span>`;
     else if (p.months <= 0) plan = `<span class="state bad">Date dépassée · il manque ${money0(p.left)}</span>`;
     else plan = `<span class="small">Il reste <b>${money0(p.left)}</b> · <b>${money0(p.perMonth)}/mois</b> pendant ${p.months} mois</span>`;
@@ -1212,16 +1306,29 @@ function saveTx() {
   }
   const nk = mkey(date);
   getMonth(nk).tx.push(t);
+  const paid = st.orig ? null : payYourself(t);
   Store.saveMonth(nk);
   closeSheet(); render();
+  if (paid) toast(`${money(paid.amount)} mis de côté pour ${goal(paid.goal).name} (payé d’abord)`);
+  else if (t.kind === 'out' && !st.orig) budgetToast(t);
 }
 function deleteTx() {
   const st = sheetState, k = st.month, removed = st.orig;
   const m = getMonth(k);
-  m.tx = m.tx.filter(x => x.id !== removed.id);
+  /* the share of a salary paid to a project leaves with it */
+  const linked = m.tx.filter(x => x.from === removed.id);
+  m.tx = m.tx.filter(x => x.id !== removed.id && x.from !== removed.id);
   Store.saveMonth(k);
   closeSheet(); render();
-  toast(`Supprimé : ${removed.note || 'opération'}`, () => { const mm = getMonth(k); if (!mm.tx.some(x => x.id === removed.id)) { mm.tx.push(removed); Store.saveMonth(k); render(); } });
+  toast(`Supprimé : ${removed.note || 'opération'}`, () => { const mm = getMonth(k); if (!mm.tx.some(x => x.id === removed.id)) { mm.tx.push(removed, ...linked); Store.saveMonth(k); render(); } });
+}
+/* Budget alert when an expense brings its category to 80 % or past its ceiling */
+function budgetToast(t) {
+  const c = cat(t.cat);
+  if (!c?.budget) return;
+  const spent = totals(mkey(t.date)).byCat[c.id] || 0, before = spent - t.amount;
+  if (spent > c.budget && before <= c.budget) toast(`${c.name} : plafond dépassé de ${money0(spent - c.budget)}`);
+  else if (spent >= c.budget * .8 && before < c.budget * .8) toast(`${c.name} : ${Math.round(spent / c.budget * 100)} % du plafond, plus que ${money0(c.budget - spent)}`);
 }
 /* Categories of a kind, most used over the last 3 months first */
 function catsByUse(kind) {
@@ -1296,6 +1403,7 @@ function commitImport() {
     const t = { id: r.id, kind: r.kind, amount: r.amount, date: r.date, note: r.note, ts, imp: 1, acc: acc.id };
     if (r.cat === MOVE) { t.kind = 'move'; t.dir = r.kind; } else { t.cat = r.cat; addRoundup(t); }
     getMonth(mkey(r.date)).tx.push(t); touched.add(mkey(r.date));
+    payYourself(t);
   }
   /* Manual entries matched to a bank line now belong to this account */
   const linked = [];
@@ -1317,6 +1425,57 @@ function commitImport() {
     S.settings.accounts = before;
     touched.forEach(k => Store.saveMonth(k)); Store.saveSettings(); render();
   });
+}
+
+/* ceilings proposed from real spending, rounded up to 10 € */
+function budgetAutoSheet() {
+  const { months, avg } = spendingAverages();
+  const rows = S.settings.cats.filter(c => c.kind === 'out').map(c => ({ c, avg: avg[c.id] || 0, prop: avg[c.id] ? Math.max(10, Math.ceil(avg[c.id] / 10) * 10) : 0 })).sort((a, b) => b.avg - a.avg);
+  openSheet(`${sheetHead('Plafonds proposés')}
+    <div class="muted small">Moyenne de ${months.map(k => MONTHS[Number(k.slice(5)) - 1]).join(', ')}, arrondie à la dizaine au-dessus. Ajuste puis applique : 0 ou vide = pas de plafond.</div>
+    <div class="list">${rows.map(r => `<div class="acc-line" style="padding:8px 0;align-items:center"><span><span class="dot" style="display:inline-block;background:${esc(r.c.color)};margin-right:8px"></span><b>${esc(r.c.name)}</b><div class="muted small">dépensé ≈ ${money0(r.avg)}/mois${r.c.budget ? ` · plafond actuel ${money0(r.c.budget)}` : ''}</div></span>
+      <input data-bud="${esc(r.c.id)}" inputmode="decimal" value="${r.prop || ''}" placeholder="—" aria-label="Plafond ${esc(r.c.name)}" style="width:90px;border:1px solid var(--line);background:var(--bg);border-radius:10px;padding:8px;text-align:right"></div>`).join('')}</div>
+    <div class="err" id="budErr"></div>
+    <div class="sheet-actions"><button class="btn block" data-action="budget-apply">Appliquer ces plafonds</button></div>`, { type: 'bud' });
+}
+function applyBudgets() {
+  const vals = [...document.querySelectorAll('[data-bud]')].map(i => [i.dataset.bud, i.value.trim() ? parseAmount(i.value) : 0]);
+  if (vals.some(([, v]) => !(v >= 0))) { $('#budErr').textContent = 'Les plafonds doivent être des nombres, par exemple 120.'; return; }
+  for (const [id, v] of vals) { const c = cat(id); if (c) c.budget = v; }
+  Store.saveSettings(); closeSheet(); S.view = 'budgets'; render();
+  toast('Plafonds mis à jour : tu seras prévenu à 80 % et au dépassement.');
+}
+/* pay yourself first settings */
+function pyfSheet() {
+  const p = S.settings.pyf || { pct: 0, goal: 'auto' };
+  const salary = S.settings.recurring.filter(r => r.kind === 'in' && r.cat === 'salaire').reduce((a, r) => a + r.amount, 0);
+  openSheet(`${sheetHead('Payer-toi d’abord')}
+    <div class="muted small">Un pourcentage de chaque revenu de la catégorie Salaire est mis de côté le jour où il tombe.</div>
+    <div class="field"><label>Part du salaire</label><div class="chips" id="pyfPct">${[0, 5, 10, 15, 20, 25].map(v => `<button class="chip" data-pyf-pct="${v}" aria-pressed="${v === (p.pct || 0)}">${v ? v + ' %' : 'Désactivé'}</button>`).join('')}</div></div>
+    <div class="small" id="pyfHint"></div>
+    <div class="field"><label for="pyfGoal">Vers</label><select id="pyfGoal" class="search"><option value="auto"${p.goal === 'auto' ? ' selected' : ''}>Fonds d’urgence d’abord, puis le projet le plus proche</option>${S.settings.goals.map(g => `<option value="${esc(g.id)}"${p.goal === g.id ? ' selected' : ''}>${esc(g.name)}</option>`).join('')}</select></div>
+    <label class="small" style="display:flex;gap:8px;align-items:center"><input type="checkbox" id="pyfPast"> Appliquer aussi aux salaires déjà enregistrés depuis septembre 2026</label>
+    <div class="sheet-actions"><button class="btn block" data-action="pyf-save">Enregistrer</button></div>`, { type: 'pyf', pct: p.pct || 0, salary });
+  paintPyf();
+}
+function paintPyf() {
+  const st = sheetState;
+  document.querySelectorAll('[data-pyf-pct]').forEach(b => b.setAttribute('aria-pressed', Number(b.dataset.pyfPct) === st.pct));
+  $('#pyfHint').innerHTML = st.pct && st.salary ? `Sur ${money0(st.salary)} de salaire : <b>${money0(st.salary * st.pct / 100)}</b> mis de côté chaque mois, <b>${money0(st.salary * st.pct / 100 * 12)}</b> par an.` : '';
+}
+function savePyf() {
+  const st = sheetState;
+  S.settings.pyf = { pct: st.pct, goal: $('#pyfGoal').value };
+  let n = 0;
+  if (st.pct && $('#pyfPast').checked) {
+    for (const [k, m] of Object.entries(S.months)) {
+      const before = m.tx.length;
+      for (const t of [...m.tx]) payYourself(t);
+      if (m.tx.length !== before) { n += m.tx.length - before; Store.saveMonth(k); }
+    }
+  }
+  Store.saveSettings(); closeSheet(); S.view = 'projets'; render();
+  toast(st.pct ? `Activé : ${st.pct} % de chaque salaire${n ? ` · ${n} salaire${n > 1 ? 's' : ''} passé${n > 1 ? 's' : ''} pris en compte` : ''}` : 'Payer-toi d’abord désactivé.');
 }
 
 /* category */
@@ -1631,6 +1790,7 @@ document.addEventListener('click', e => {
       }
       paintRecSheet(); return;
     }
+    if (t.dataset.pyfPct !== undefined && sheetState.type === 'pyf') { sheetState.pct = Number(t.dataset.pyfPct); paintPyf(); return; }
     if (t.dataset.color) { sheetState.cat.color = t.dataset.color; document.querySelectorAll('#colorPick .chip').forEach(b => b.setAttribute('aria-pressed', b.dataset.color === t.dataset.color)); return; }
   }
 
@@ -1670,6 +1830,15 @@ document.addEventListener('click', e => {
       sheetState.step--; paintWiz(); break;
     case 'wiz-finish': wizFinish(!!t.dataset.skip); break;
     case 'import-csv': $('#csvFile').click(); break;
+    case 'budget-auto': budgetAutoSheet(); break;
+    case 'budget-apply': applyBudgets(); break;
+    case 'pyf': pyfSheet(); break;
+    case 'pyf-save': savePyf(); break;
+    case 'em-create': {
+      const g = { id: newId(), name: 'Fonds d’urgence', target: emergencyTarget(), deadline: '', initial: 0, emergency: true };
+      S2.goals.unshift(g); Store.saveSettings(); goalSheet(g); break;
+    }
+    case 'em-update': { const g = goal(t.dataset.id); if (g) { g.target = emergencyTarget(); Store.saveSettings(); render(); } break; }
     case 'imp-go': commitImport(); break;
     case 'sub-add': {
       const x = detectSubscriptions().find(s => s.key === t.dataset.key);
